@@ -526,6 +526,7 @@ pub struct CpuManager {
     vcpu_states: Vec<VcpuState>,
     selected_cpu: u32,
     vcpus: Vec<Arc<Mutex<Vcpu>>>,
+    parked_vcpus: Vec<Arc<Mutex<Vcpu>>>,
     seccomp_action: SeccompAction,
     vm_ops: Arc<dyn VmOps>,
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
@@ -790,6 +791,8 @@ impl CpuManager {
             vm_debug_evt,
             selected_cpu: 0,
             vcpus: Vec::with_capacity(max_vcpus),
+            #[cfg(target_arch = "aarch64")]
+            parked_vcpus: Vec::with_capacity(usize::from(config.max_vcpus)),
             seccomp_action,
             vm_ops,
             acpi_address: None,
@@ -860,10 +863,26 @@ impl CpuManager {
             vcpu.saved_state = Some(state);
         }
 
+        debug!("Arc::new start... ");
         let vcpu = Arc::new(Mutex::new(vcpu));
+        debug!("Arc::new end... ");
 
         // Adding vCPU to the CpuManager's vCPU list.
+        debug!(
+            "vcpus push start... cpu_id = {}, boot_vcpus = {}, max_vcpus = {}",
+            cpu_id,
+            self.config.boot_vcpus,
+            self.config.max_vcpus
+        );
+        #[cfg(target_arch = "x86_64")]
         self.vcpus.push(vcpu.clone());
+        #[cfg(target_arch = "aarch64")]
+        if cpu_id < self.config.boot_vcpus {
+            self.vcpus.push(vcpu.clone());
+        } else {
+            self.parked_vcpus.push(vcpu.clone());
+        }
+        debug!("vcpus push end... ");
 
         Ok(vcpu)
     }
@@ -935,10 +954,11 @@ impl CpuManager {
     ) -> Result<Vec<Arc<Mutex<Vcpu>>>> {
         let mut vcpus: Vec<Arc<Mutex<Vcpu>>> = vec![];
         info!(
-            "Request to create new vCPUs: desired = {}, max = {}, allocated = {}, present = {}",
+            "Request to create new vCPUs: desired = {}, max = {}, allocated = {}, parked allocated = {}, present = {}",
             desired_vcpus,
             self.config.max_vcpus,
             self.vcpus.len(),
+            self.parked_vcpus.len(),
             self.present_vcpus()
         );
 
@@ -975,11 +995,31 @@ impl CpuManager {
             }
         }
 
+        if self.config.max_vcpus > self.config.boot_vcpus {
+            for cpu in self.parked_vcpus.iter() {
+                let cpu = cpu.lock().unwrap();
+                // Check if PMU attr is available, if not, log the information.
+                if cpu.vcpu.has_pmu_support() {
+                    cpu.vcpu.init_pmu(irq).map_err(Error::InitPmu)?;
+                } else {
+                    debug!(
+                        "PMU attribute is not supported in vCPU{}, skip PMU init!",
+                        cpu.id
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
         Ok(true)
     }
 
     pub fn vcpus(&self) -> Vec<Arc<Mutex<Vcpu>>> {
         self.vcpus.clone()
+    }
+
+    pub fn parked_vcpus(&self) -> Vec<Arc<Mutex<Vcpu>>> {
+        self.parked_vcpus.clone()
     }
 
     fn start_vcpu(
@@ -1252,6 +1292,11 @@ impl CpuManager {
         inserting: bool,
         paused: Option<bool>,
     ) -> Result<()> {
+        debug!(
+            "Starting vCPUs: desired = {}, config_max_vcpus = {}",
+            desired_vcpus,
+            self.config.max_vcpus
+        );
         if desired_vcpus > self.config.max_vcpus {
             return Err(Error::DesiredVCpuCountExceedsMax);
         }
@@ -1265,17 +1310,33 @@ impl CpuManager {
         }
 
         info!(
-            "Starting vCPUs: desired = {}, allocated = {}, present = {}, paused = {}",
+            "Starting vCPUs: desired = {}, vcpu allocated = {}, parked vcpu allocated = {}, present = {}, paused = {}",
             desired_vcpus,
             self.vcpus.len(),
+            self.parked_vcpus.len(),
             self.present_vcpus(),
             self.vcpus_pause_signalled.load(Ordering::SeqCst)
         );
 
         // This reuses any inactive vCPUs as well as any that were newly created
         for vcpu_id in self.present_vcpus()..desired_vcpus {
-            let vcpu = Arc::clone(&self.vcpus[vcpu_id as usize]);
-            self.start_vcpu(vcpu, vcpu_id, vcpu_thread_barrier.clone(), inserting)?;
+            #[cfg(target_arch = "x86_64")]
+            {
+                let vcpu = Arc::clone(&self.vcpus[vcpu_id as usize]);
+                self.start_vcpu(vcpu, vcpu_id, vcpu_thread_barrier.clone(), inserting)?;
+            }
+            #[cfg(target_arch = "aarch64")]
+            if vcpu_id < self.config.boot_vcpus {
+                let vcpu = Arc::clone(&self.vcpus[vcpu_id as usize]);
+                self.start_vcpu(vcpu, vcpu_id, vcpu_thread_barrier.clone(), inserting)?;
+            } else {
+                debug!(
+                    "parked vcpus = {}, get id = {} ", self.parked_vcpus.len(), vcpu_id - self.config.boot_vcpus
+                );
+
+                let vcpu = Arc::clone(&self.parked_vcpus[(vcpu_id - self.config.boot_vcpus) as usize]);
+                self.start_vcpu(vcpu, vcpu_id, vcpu_thread_barrier.clone(), inserting)?;
+            }
         }
 
         // Unblock all CPU threads.
@@ -1285,6 +1346,12 @@ impl CpuManager {
 
     fn mark_vcpus_for_removal(&mut self, desired_vcpus: u32) {
         // Mark vCPUs for removal, actual removal happens on ejection
+        debug!(
+            "mark_vcpus_for_removal: desired_vcpus = {}, present_vcpus = {}",
+            desired_vcpus,
+            self.present_vcpus()
+        );
+
         for cpu_id in desired_vcpus..self.present_vcpus() {
             self.vcpu_states[usize::try_from(cpu_id).unwrap()].removing = true;
             self.vcpu_states[usize::try_from(cpu_id).unwrap()]
@@ -1327,6 +1394,15 @@ impl CpuManager {
         self.create_vcpus(self.boot_vcpus(), snapshot)
     }
 
+    pub fn create_max_vcpus(
+        &mut self,
+        snapshot: Option<Snapshot>,
+    ) -> Result<Vec<Arc<Mutex<Vcpu>>>> {
+        trace_scoped!("create_max_vcpus");
+
+        self.create_vcpus(self.max_vcpus(), snapshot)
+    }
+
     // Starts all the vCPUs that the VM is booting with. Blocks until all vCPUs are running.
     pub fn start_boot_vcpus(&mut self, paused: bool) -> Result<()> {
         self.activate_vcpus(self.boot_vcpus(), false, Some(paused))
@@ -1360,9 +1436,12 @@ impl CpuManager {
 
         match desired_vcpus.cmp(&self.present_vcpus()) {
             cmp::Ordering::Greater => {
-                let vcpus = self.create_vcpus(desired_vcpus, None)?;
-                for vcpu in vcpus {
-                    self.configure_vcpu(vcpu, None)?
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let vcpus = self.create_vcpus(desired_vcpus, None)?;
+                    for vcpu in vcpus {
+                        self.configure_vcpu(vcpu, None)?
+                    }
                 }
                 self.activate_vcpus(desired_vcpus, true, None)?;
                 Ok(true)
@@ -1460,6 +1539,22 @@ impl CpuManager {
             .collect()
     }
 
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_parked_mpidrs(&self) -> Vec<u64> {
+        self.parked_vcpus
+            .iter()
+            .map(|cpu| cpu.lock().unwrap().get_mpidr())
+            .collect()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_parked_saved_states(&self) -> Vec<CpuState> {
+        self.parked_vcpus
+            .iter()
+            .map(|cpu| cpu.lock().unwrap().get_saved_state().unwrap())
+            .collect()
+    }
+
     pub fn get_vcpu_topology(&self) -> Option<(u16, u16, u16, u16)> {
         self.config.topology.clone().map(|t| {
             (
@@ -1477,6 +1572,7 @@ impl CpuManager {
         // This is also checked in the commandline parsing.
         assert!(self.config.boot_vcpus <= self.config.max_vcpus);
 
+        #[cfg(target_arch = "x86_64")]
         let mut madt = Sdt::new(*b"APIC", 44, 5, *b"CLOUDH", *b"CHMADT  ", 1);
         #[cfg(target_arch = "x86_64")]
         {
@@ -1520,14 +1616,21 @@ impl CpuManager {
         }
 
         #[cfg(target_arch = "aarch64")]
+        let mut madt = Sdt::new(*b"APIC", 44, 4, *b"CLOUDH", *b"CHMADT  ", 1);
+        #[cfg(target_arch = "aarch64")]
         {
             /* Notes:
              * Ignore Local Interrupt Controller Address at byte offset 36 of MADT table.
              */
 
             // See section 5.2.12.14 GIC CPU Interface (GICC) Structure in ACPI spec.
-            for cpu in 0..self.config.boot_vcpus {
-                let vcpu = &self.vcpus[cpu as usize];
+            for cpu in 0..self.config.max_vcpus {
+                let vcpu = if cpu < self.config.boot_vcpus {
+                    &self.vcpus[cpu as usize]
+                } else {
+                    &self.parked_vcpus[(cpu - self.config.boot_vcpus) as usize]
+                };
+
                 let mpidr = vcpu.lock().unwrap().get_mpidr();
                 /* ARMv8 MPIDR format:
                      Bits [63:40] Must be zero
@@ -1538,13 +1641,21 @@ impl CpuManager {
                      Bits [7:0] Aff0 : Match Aff0 of target processor MPIDR
                 */
                 let mpidr_mask = 0xff_00ff_ffff;
+                let flag = if cpu < self.config.boot_vcpus {
+                    1
+                } else {
+                    1 << 3
+                };
+                debug!(
+                    "cpu id = {}, mpdir = {}, gicc flags = {}", cpu, (mpidr & mpidr_mask), flag
+                );
                 let gicc = GicC {
                     r#type: acpi::ACPI_APIC_GENERIC_CPU_INTERFACE,
                     length: 80,
                     reserved0: 0,
                     cpu_interface_number: cpu,
                     uid: cpu,
-                    flags: 1,
+                    flags: flag,
                     parking_version: 0,
                     performance_interrupt: 0,
                     parked_address: 0,
@@ -1561,7 +1672,7 @@ impl CpuManager {
 
                 madt.append(gicc);
             }
-            let vgic_config = Gic::create_default_config(self.config.boot_vcpus.into());
+            let vgic_config = Gic::create_default_config(self.config.max_vcpus.into());
 
             // GIC Distributor structure. See section 5.2.12.15 in ACPI spec.
             let gicd = GicD {
@@ -1619,13 +1730,13 @@ impl CpuManager {
         let mut pptt = Sdt::new(*b"PPTT", 36, 2, *b"CLOUDH", *b"CHPPTT  ", 1);
 
         for cluster_idx in 0..packages {
-            if cpus < self.config.boot_vcpus as usize {
+            if cpus < self.config.max_vcpus as usize {
                 let cluster_offset = pptt.len() - pptt_start;
                 let cluster_hierarchy_node = ProcessorHierarchyNode {
                     r#type: 0,
                     length: 20,
                     reserved: 0,
-                    flags: 0x2,
+                    flags: 0x1,
                     parent: 0,
                     acpi_processor_id: cluster_idx as u32,
                     num_private_resources: 0,
@@ -2017,7 +2128,7 @@ impl Aml for Cpu {
                     Bit [4] – Set if the battery is present.
                     Bits [31:5] – Reserved (must be cleared).
                     */
-                    #[cfg(target_arch = "x86_64")]
+                    //#[cfg(target_arch = "x86_64")]
                     &aml::Method::new(
                         "_STA".into(),
                         0,
@@ -2040,7 +2151,7 @@ impl Aml for Cpu {
                     #[cfg(target_arch = "x86_64")]
                     &aml::Name::new("_MAT".into(), &aml::BufferData::new(mat_data)),
                     // Trigger CPU ejection
-                    #[cfg(target_arch = "x86_64")]
+                    //#[cfg(target_arch = "x86_64")]
                     &aml::Method::new(
                         "_EJ0".into(),
                         1,
@@ -2057,7 +2168,7 @@ impl Aml for Cpu {
                 vec![
                     &aml::Name::new("_HID".into(), &"ACPI0007"),
                     &aml::Name::new("_UID".into(), &self.cpu_id),
-                    #[cfg(target_arch = "x86_64")]
+                    //#[cfg(target_arch = "x86_64")]
                     &aml::Method::new(
                         "_STA".into(),
                         0,
@@ -2121,6 +2232,9 @@ impl Aml for CpuMethods {
                     &aml::If::new(
                         &aml::Equal::new(&aml::Path::new("\\_SB_.PRES.CPEN"), &aml::ONE),
                         vec![&aml::Store::new(&aml::Local(0), &0xfu8)],
+                    ),
+                    &aml::Else::new(
+                        vec![&aml::Store::new(&aml::Local(0), &0xdu8)],
                     ),
                     // Release lock
                     &aml::Release::new("\\_SB_.PRES.CPLK".into()),
@@ -2257,6 +2371,66 @@ impl Aml for CpuManager {
                             aml::FieldEntry::Named(*b"CRMV", 1),
                             aml::FieldEntry::Named(*b"CEJ0", 1),
                             aml::FieldEntry::Reserved(4),
+                            aml::FieldEntry::Named(*b"CCMD", 8),
+                        ],
+                    ),
+                    &aml::Field::new(
+                        "PRST".into(),
+                        aml::FieldAccessType::DWord,
+                        aml::FieldLockRule::NoLock,
+                        aml::FieldUpdateRule::Preserve,
+                        vec![
+                            aml::FieldEntry::Named(*b"CSEL", 32),
+                            aml::FieldEntry::Reserved(32),
+                            aml::FieldEntry::Named(*b"CDAT", 32),
+                        ],
+                    ),
+                ],
+            )
+            .to_aml_bytes(sink);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if let Some(acpi_address) = self.acpi_address {
+            // CPU hotplug controller
+            aml::Device::new(
+                "_SB_.PRES".into(),
+                vec![
+                    &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A06")),
+                    &aml::Name::new("_UID".into(), &"CPU Hotplug Controller"),
+                    // Mutex to protect concurrent access as we write to choose CPU and then read back status
+                    &aml::Mutex::new("CPLK".into(), 0),
+                    &aml::Name::new(
+                        "_CRS".into(),
+                        &aml::ResourceTemplate::new(vec![&aml::AddressSpace::new_memory(
+                            aml::AddressSpaceCacheable::NotCacheable,
+                            true,
+                            acpi_address.0,
+                            acpi_address.0 + CPU_MANAGER_ACPI_SIZE as u64 - 1,
+                            None,
+                        )]),
+                    ),
+                    // OpRegion and Fields map MMIO range into individual field values
+                    &aml::OpRegion::new(
+                        "PRST".into(),
+                        aml::OpRegionSpace::SystemMemory,
+                        &(acpi_address.0 as usize),
+                        &CPU_MANAGER_ACPI_SIZE,
+                    ),
+                    &aml::Field::new(
+                        "PRST".into(),
+                        aml::FieldAccessType::Byte,
+                        aml::FieldLockRule::NoLock,
+                        aml::FieldUpdateRule::WriteAsZeroes,
+                        vec![
+                            aml::FieldEntry::Reserved(32),
+                            aml::FieldEntry::Named(*b"CPEN", 1),
+                            aml::FieldEntry::Named(*b"CINS", 1),
+                            aml::FieldEntry::Named(*b"CRMV", 1),
+                            aml::FieldEntry::Named(*b"CEJ0", 1),
+                            aml::FieldEntry::Named(*b"CEJF", 1),
+                            aml::FieldEntry::Named(*b"CPRS", 1),
+                            aml::FieldEntry::Reserved(2),
                             aml::FieldEntry::Named(*b"CCMD", 8),
                         ],
                     ),
