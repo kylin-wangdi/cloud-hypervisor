@@ -965,7 +965,6 @@ impl CpuManager {
         #[cfg(target_arch = "aarch64")]
         if cpu_id < self.config.boot_vcpus {
             self.vcpus.push(vcpu.clone());
-            self.up_vcpus.fetch_add(1, Ordering::SeqCst);
         } else {
             self.parked_vcpus.push(vcpu.clone());
         }
@@ -1501,15 +1500,18 @@ impl CpuManager {
                 self.start_vcpu(vcpu, vcpu_id, vcpu_thread_barrier.clone(), inserting)?;
             }
             #[cfg(target_arch = "aarch64")]
-            if vcpu_id < self.config.boot_vcpus {
+            if !inserting {
                 let vcpu = Arc::clone(&self.vcpus[vcpu_id as usize]);
+                self.up_vcpus.fetch_add(1, Ordering::SeqCst);
                 self.start_vcpu(vcpu, vcpu_id, vcpu_thread_barrier.clone(), inserting)?;
             } else {
                 debug!(
-                    "parked vcpus = {}, get id = {} ", self.parked_vcpus.len(), vcpu_id - self.config.boot_vcpus
+                    "parked vcpus = {}, get id = {} ", self.parked_vcpus.len(), vcpu_id - self.present_vcpus()
                 );
 
-                let vcpu = Arc::clone(&self.parked_vcpus[(vcpu_id - self.config.boot_vcpus) as usize]);
+                let vcpu = self.parked_vcpus.remove(0);
+                self.vcpus.push(vcpu.clone());
+                self.up_vcpus.fetch_add(1, Ordering::SeqCst);
                 self.start_vcpu(vcpu, vcpu_id, vcpu_thread_barrier.clone(), inserting)?;
             }
         }
