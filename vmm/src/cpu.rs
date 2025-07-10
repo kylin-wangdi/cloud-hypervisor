@@ -48,7 +48,7 @@ use hypervisor::arch::x86::CpuIdEntry;
 use hypervisor::arch::x86::MsrEntry;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use hypervisor::arch::x86::SpecialRegisters;
-use hypervisor::kvm::kvm_bindings::KVM_MP_STATE_RUNNABLE;
+use hypervisor::kvm::kvm_bindings::{KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_STOPPED};
 #[cfg(target_arch = "aarch64")]
 use hypervisor::kvm::{kvm_bindings, PSCI_0_2_FN64_CPU_ON, PSCI_0_2_FN_CPU_OFF};
 #[cfg(feature = "tdx")]
@@ -1138,6 +1138,7 @@ impl CpuManager {
             .clone();
         let vcpu_power_ctl_signalled = self.vcpu_states[usize::from(vcpu_id)].vcpu_power_ctl_signalled.clone();
         let vcpu_senders = self.vcpu_senders.clone();
+        let vm = self.vm.clone();
 
         // Prepare the CPU set the current vCPU is expected to run onto.
         let cpuset = self.affinity.get(&vcpu_id).map(|host_cpus| {
@@ -1278,6 +1279,7 @@ impl CpuManager {
                                     match power_ctl {
                                         PowerCtl::PowerOn(entry, context_id) => {
                                             debug!("recv on cpu{}, entry {}, contextid {}", vcpu_id, entry, context_id);
+                                            vcpu.init(&vm).unwrap();//TODO error handle
                                             vcpu.power_on_reset(entry, context_id).unwrap();
                                         }
                                     }
@@ -1411,6 +1413,13 @@ impl CpuManager {
                                                     },
                                                     PSCI_0_2_FN_CPU_OFF => {
                                                         // TODO
+                                                        debug!("cpu{}", vcpu_id);
+                                                        let mut ret_kvm_state = kvm_state.clone();
+                                                        ret_kvm_state.mp_state.mp_state = KVM_MP_STATE_STOPPED;
+                                                        ret_kvm_state.core_regs.regs.regs[0] = PSCI_RET_SUCCESS as u64;
+                                                        let ret_accel_cpu_state = CpuState::Kvm(ret_kvm_state);
+                                                        vcpu.vcpu.set_state(&ret_accel_cpu_state).unwrap();
+                                                        debug!("cpu{} cpu off.", vcpu_id);
                                                     }
                                                     _ => {
                                                     }
@@ -1529,7 +1538,23 @@ impl CpuManager {
             self.present_vcpus()
         );
 
-        for cpu_id in desired_vcpus..self.present_vcpus() {
+        for cpu_id in (desired_vcpus..self.present_vcpus()).rev() {
+            #[cfg(target_arch = "aarch64")]
+            {
+                debug!(
+                    "mark_vcpus_for_removal: vcpu_id = {}",
+                    cpu_id
+                );
+                let vcpu = self.vcpus.remove(cpu_id as usize);
+                //self.parked_vcpus.push(vcpu.clone());
+                self.parked_vcpus.insert(0, vcpu.clone());
+                self.up_vcpus.fetch_sub(1, Ordering::SeqCst);
+                debug!(
+                    "mark_vcpus_for_removal: vcpus = {}, parked vcpus = {}",
+                    self.vcpus.len(),
+                    self.parked_vcpus.len()
+                );
+            }
             self.vcpu_states[usize::try_from(cpu_id).unwrap()].removing = true;
             self.vcpu_states[usize::try_from(cpu_id).unwrap()]
                 .pending_removal
@@ -1553,7 +1578,9 @@ impl CpuManager {
         state.signal_thread();
         state.wait_until_signal_acknowledged();
         state.join_thread()?;
-        state.handle = Arc::new(Mutex::new(None));
+        //state.handle = Arc::new(Mutex::new(None));
+        let mut handle_guard = state.handle.lock().unwrap();
+        *handle_guard = None;
 
         // Once the thread has exited, clear the "kill" so that it can reused
         state.kill.store(false, Ordering::SeqCst);
@@ -2305,11 +2332,22 @@ impl Aml for Cpu {
                     Bit [4] – Set if the battery is present.
                     Bits [31:5] – Reserved (must be cleared).
                     */
-                    //#[cfg(target_arch = "x86_64")]
+                    #[cfg(target_arch = "x86_64")]
                     &aml::Method::new(
                         "_STA".into(),
                         0,
                         false,
+                        // Call into CSTA method which will interrogate device
+                        vec![&aml::Return::new(&aml::MethodCall::new(
+                            "CSTA".into(),
+                            vec![&self.cpu_id],
+                        ))],
+                    ),
+                    #[cfg(target_arch = "aarch64")]
+                    &aml::Method::new(
+                        "_STA".into(),
+                        0,
+                        true,
                         // Call into CSTA method which will interrogate device
                         vec![&aml::Return::new(&aml::MethodCall::new(
                             "CSTA".into(),
@@ -2431,7 +2469,11 @@ impl Aml for CpuMethods {
                 cpu_notifies_refs.push(&cpu_notifies[usize::try_from(cpu_id).unwrap()]);
             }
 
+            #[cfg(target_arch = "x86_64")]
             aml::Method::new("CTFY".into(), 2, true, cpu_notifies_refs).to_aml_bytes(sink);
+
+            #[cfg(target_arch = "aarch64")]
+            aml::Method::new("CTFY".into(), 2, false, cpu_notifies_refs).to_aml_bytes(sink);
 
             aml::Method::new(
                 "CEJ0".into(),
