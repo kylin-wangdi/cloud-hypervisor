@@ -17,10 +17,13 @@ use std::io::Write;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::mem::size_of;
 use std::os::unix::thread::JoinHandleExt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::mpsc::{Sender, Receiver};
 use std::{cmp, io, result, thread};
 
+use acpi_tables::aml::Or;
 #[cfg(not(target_arch = "riscv64"))]
 use acpi_tables::sdt::Sdt;
 use acpi_tables::{Aml, aml};
@@ -35,6 +38,21 @@ use devices::interrupt_controller::InterruptController;
 use gdbstub_arch::aarch64::reg::AArch64CoreRegs as CoreRegs;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use gdbstub_arch::x86::reg::{X86_64CoreRegs as CoreRegs, X86SegmentRegs};
+#[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
+use hypervisor::arch::aarch64::regs::{ID_AA64MMFR0_EL1, TCR_EL1, TTBR1_EL1};
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use hypervisor::arch::x86::msr_index;
+#[cfg(target_arch = "x86_64")]
+use hypervisor::arch::x86::CpuIdEntry;
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use hypervisor::arch::x86::MsrEntry;
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use hypervisor::arch::x86::SpecialRegisters;
+use hypervisor::kvm::kvm_bindings::KVM_MP_STATE_RUNNABLE;
+#[cfg(target_arch = "aarch64")]
+use hypervisor::kvm::{kvm_bindings, PSCI_0_2_FN64_CPU_ON, PSCI_0_2_FN_CPU_OFF};
+#[cfg(feature = "tdx")]
+use hypervisor::kvm::{TdxExitDetails, TdxExitStatus};
 #[cfg(target_arch = "x86_64")]
 use hypervisor::CpuVendor;
 #[cfg(feature = "kvm")]
@@ -108,6 +126,9 @@ macro_rules! extract_bits_64_without_offset {
 }
 
 pub const CPU_MANAGER_ACPI_SIZE: usize = 0xc;
+pub const PSCI_RET_SUCCESS: i32 = 0;
+pub const PSCI_RET_DENIED: i32 = -3;
+pub const PSCI_RET_ALREADY_ON: i32 = -4;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -332,6 +353,10 @@ macro_rules! round_up {
     };
 }
 
+pub enum PowerCtl {
+    PowerOn(u64, u64), // entry, context_id
+}
+
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     // The hypervisor abstracted CPU.
@@ -342,6 +367,10 @@ pub struct Vcpu {
     saved_state: Option<CpuState>,
     #[cfg(target_arch = "x86_64")]
     vendor: CpuVendor,
+    #[cfg(target_arch = "aarch64")]
+    enabled: bool,
+    #[cfg(target_arch = "aarch64")]
+    receiver: Receiver<PowerCtl>,
 }
 
 impl Vcpu {
@@ -359,11 +388,14 @@ impl Vcpu {
         vm: &Arc<dyn hypervisor::Vm>,
         vm_ops: Option<Arc<dyn VmOps>>,
         #[cfg(target_arch = "x86_64")] cpu_vendor: CpuVendor,
+        receiver: Receiver<PowerCtl>,
     ) -> Result<Self> {
         let vcpu = vm
             .create_vcpu(apic_id, vm_ops)
             .map_err(|e| Error::VcpuCreate(e.into()))?;
+        //let (sender, receiver) = mpsc::channel::<PowerCtl>();
         // Initially the cpuid per vCPU is the one supported by this VM.
+        #[cfg(target_arch = "aarch64")]
         Ok(Vcpu {
             vcpu,
             id,
@@ -372,6 +404,10 @@ impl Vcpu {
             saved_state: None,
             #[cfg(target_arch = "x86_64")]
             vendor: cpu_vendor,
+            #[cfg(target_arch = "aarch64")]
+            enabled: true,
+            #[cfg(target_arch = "aarch64")]
+            receiver,
         })
     }
 
@@ -411,6 +447,17 @@ impl Vcpu {
         )
         .map_err(Error::VcpuConfiguration)?;
 
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.enabled = enabled;
         Ok(())
     }
 
@@ -485,6 +532,17 @@ impl Vcpu {
             .map_err(Error::VcpuSetGicrBaseAddr)?;
         Ok(())
     }
+
+    pub fn power_on_reset(&self, entry: u64, context_id: u64) -> Result<()> {
+        let mut reset_accel_cpu_state = self.vcpu.state().unwrap().clone();
+        let CpuState::Kvm(ref mut reset_kvm_state) = reset_accel_cpu_state;
+        // let mut reset_kvm_state = self.vcpu.state().unwrap().clone();
+        reset_kvm_state.mp_state.mp_state = KVM_MP_STATE_RUNNABLE;
+        reset_kvm_state.core_regs.regs.regs[0] = context_id;
+        reset_kvm_state.core_regs.regs.pc = entry;
+        self.vcpu.set_state(&reset_accel_cpu_state).unwrap();
+        Ok(())
+    }
 }
 
 impl Pausable for Vcpu {}
@@ -535,6 +593,9 @@ pub struct CpuManager {
     affinity: BTreeMap<u32, Vec<usize>>,
     dynamic: bool,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+    vcpu_senders: Vec<Sender<PowerCtl>>,
+    #[cfg(target_arch = "aarch64")]
+    up_vcpus: Arc<AtomicU32>,
     #[cfg(feature = "sev_snp")]
     sev_snp_enabled: bool,
 }
@@ -626,20 +687,21 @@ impl BusDevice for CpuManager {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct VcpuState {
     inserting: bool,
     removing: bool,
     pending_removal: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
+    handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     kill: Arc<AtomicBool>,
     vcpu_run_interrupted: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    vcpu_power_ctl_signalled: Arc<AtomicBool>,
 }
 
 impl VcpuState {
     fn active(&self) -> bool {
-        self.handle.is_some()
+        self.handle.lock().unwrap().is_some()
     }
 
     /// Sends a signal to the underlying thread.
@@ -647,7 +709,7 @@ impl VcpuState {
     /// Please call [`Self::wait_until_signal_acknowledged`] afterward to block
     /// until the vCPU thread has acknowledged the signal.
     fn signal_thread(&self) {
-        if let Some(handle) = self.handle.as_ref() {
+        if let Some(handle) = self.handle.lock().unwrap().as_ref() {
             // SAFETY: FFI call with correct arguments
             unsafe {
                 libc::pthread_kill(handle.as_pthread_t() as _, SIGRTMIN());
@@ -672,8 +734,21 @@ impl VcpuState {
         }
     }
 
+    fn signal_thread_powerctl(&self) {
+        self.vcpu_power_ctl_signalled.store(true, Ordering::SeqCst);
+        debug!("enter signal therad powerctl");
+        if let Some(handle) = self.handle.lock().unwrap().as_ref() {
+            // SAFETY: FFI call with correct arguments
+            unsafe {
+                libc::pthread_kill(handle.as_pthread_t() as _, SIGRTMIN());
+            }
+            debug!("sent signal therad powerctl to vcpu thread");
+        }
+        // TODO: retry process
+    }
+
     fn join_thread(&mut self) -> Result<()> {
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.lock().unwrap().take() {
             handle.join().map_err(Error::ThreadCleanup)?
         }
 
@@ -681,7 +756,7 @@ impl VcpuState {
     }
 
     fn unpark_thread(&self) {
-        if let Some(handle) = self.handle.as_ref() {
+        if let Some(handle) = self.handle.lock().unwrap().as_ref() {
             handle.thread().unpark()
         }
     }
@@ -713,6 +788,7 @@ impl CpuManager {
         let max_vcpus = usize::try_from(config.max_vcpus).unwrap();
         let mut vcpu_states = Vec::with_capacity(max_vcpus);
         vcpu_states.resize_with(max_vcpus, VcpuState::default);
+        let vcpu_senders = Vec::with_capacity(max_vcpus);
         let hypervisor_type = hypervisor.hypervisor_type();
         #[cfg(target_arch = "x86_64")]
         let cpu_vendor = hypervisor.get_cpu_vendor();
@@ -800,6 +876,8 @@ impl CpuManager {
             affinity,
             dynamic,
             hypervisor: hypervisor.clone(),
+            vcpu_senders,
+            up_vcpus: Arc::new(AtomicU32::new(0)),
             #[cfg(feature = "sev_snp")]
             sev_snp_enabled,
         })))
@@ -839,6 +917,8 @@ impl CpuManager {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         let x2apic_id = cpu_id;
 
+        let (sender, receiver) = mpsc::channel::<PowerCtl>();
+        self.vcpu_senders.push(sender);
         let mut vcpu = Vcpu::new(
             cpu_id,
             x2apic_id,
@@ -846,7 +926,13 @@ impl CpuManager {
             Some(self.vm_ops.clone()),
             #[cfg(target_arch = "x86_64")]
             self.hypervisor.get_cpu_vendor(),
+            receiver,
         )?;
+        if cpu_id < self.config.boot_vcpus {
+            vcpu.enabled = true;
+        } else {
+            vcpu.enabled = false;
+        }
 
         if let Some(snapshot) = snapshot {
             // AArch64 vCPUs should be initialized after created.
@@ -879,6 +965,7 @@ impl CpuManager {
         #[cfg(target_arch = "aarch64")]
         if cpu_id < self.config.boot_vcpus {
             self.vcpus.push(vcpu.clone());
+            self.up_vcpus.fetch_add(1, Ordering::SeqCst);
         } else {
             self.parked_vcpus.push(vcpu.clone());
         }
@@ -1050,6 +1137,8 @@ impl CpuManager {
         let vcpu_paused = self.vcpu_states[usize::try_from(vcpu_id).unwrap()]
             .paused
             .clone();
+        let vcpu_power_ctl_signalled = self.vcpu_states[usize::from(vcpu_id)].vcpu_power_ctl_signalled.clone();
+        let vcpu_senders = self.vcpu_senders.clone();
 
         // Prepare the CPU set the current vCPU is expected to run onto.
         let cpuset = self.affinity.get(&vcpu_id).map(|host_cpus| {
@@ -1076,11 +1165,16 @@ impl CpuManager {
         let interrupt_controller_clone = self.interrupt_controller.as_ref().cloned();
 
         info!("Starting vCPU: cpu_id = {}", vcpu_id);
+        let vcpu_states = self.vcpu_states.clone();
+        let up_vcpus = self.up_vcpus.clone();
+        //let vcpus = self.vcpus();
+        //let parked_vcpus = self.parked_vcpus();
 
         let handle = Some(
             thread::Builder::new()
                 .name(format!("vcpu{vcpu_id}"))
                 .spawn(move || {
+                    debug!("vcpu {} thread start running", vcpu_id);
                     // Schedule the thread to run on the expected CPU set
                     if let Some(cpuset) = cpuset.as_ref() {
                         // SAFETY: FFI call with correct arguments
@@ -1117,7 +1211,7 @@ impl CpuManager {
                     // Block until all CPUs are ready.
                     vcpu_thread_barrier.wait();
 
-                    std::panic::catch_unwind(move || {
+                    std::panic::catch_unwind(AssertUnwindSafe(move || {
                         loop {
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
@@ -1176,6 +1270,20 @@ impl CpuManager {
                                         break;
                                     }
                                 }
+                            }
+
+                            if vcpu_power_ctl_signalled.load(Ordering::SeqCst) {
+                                let vcpu = vcpu.lock().unwrap();
+                                if let Ok(power_ctl) = vcpu.receiver.recv() {
+                                    debug!("recv powerctl message on cpu{}", vcpu_id);
+                                    match power_ctl {
+                                        PowerCtl::PowerOn(entry, context_id) => {
+                                            debug!("recv on cpu{}, entry {}, contextid {}", vcpu_id, entry, context_id);
+                                            vcpu.power_on_reset(entry, context_id).unwrap();
+                                        }
+                                    }
+                                }
+                                vcpu_power_ctl_signalled.store(false, Ordering::SeqCst);
                             }
 
                             // We've been told to terminate
@@ -1248,6 +1356,69 @@ impl CpuManager {
                                             unreachable!("Couldn't get a mutable reference from Arc<dyn Vcpu> as there are multiple instances");
                                         }
                                     }
+                                    #[cfg(target_arch = "aarch64")]
+                                    VmExit::Hypercall => {
+                                        // only handle psci call here for now
+                                        // cloudh psci uses hvc call
+                                        let state = vcpu.vcpu.state().unwrap();
+                                        match state {
+                                            CpuState::Kvm(kvm_state) => {
+                                                debug!(
+                                                    "hypercall got first 4 regs = {} {} {} {}", kvm_state.core_regs.regs.regs[0], kvm_state.core_regs.regs.regs[1], kvm_state.core_regs.regs.regs[2], kvm_state.core_regs.regs.regs[3]
+                                                );
+                                                match kvm_state.core_regs.regs.regs[0] as u32 {
+                                                    PSCI_0_2_FN64_CPU_ON => {
+                                                        // TODO
+                                                        let mpidr = kvm_state.core_regs.regs.regs[1];
+                                                        let entry = kvm_state.core_regs.regs.regs[2];
+                                                        let context_id = kvm_state.core_regs.regs.regs[3];
+                                                        let up_vcpus = up_vcpus.load(Ordering::SeqCst);
+                                                        if mpidr < up_vcpus as u64 { // vcpu plugged in
+                                                            //let cpu_manager = shared_cpu_manager.lock().unwrap();
+                                                            //let target_vcpu_state = &cpu_manager.vcpu_states[mpidr as usize];
+                                                            debug!("enter poweron cpu {}", mpidr);
+                                                            let psci_sender = vcpu_senders[mpidr as usize].clone();
+                                                            debug!("got clone of sender cpu {}", mpidr);
+                                                            psci_sender.send(PowerCtl::PowerOn(entry, context_id)).unwrap();
+                                                            debug!("sent psci cpu on to cpu {}", mpidr);
+                                                            //target_vcpu_state.signal_thread_powerctl();
+                                                            vcpu_states[mpidr as usize].signal_thread_powerctl();
+                                                            debug!("powerctl signaled cpu {}", mpidr);
+                                                            let mut ret_kvm_state = kvm_state.clone();
+                                                            ret_kvm_state.core_regs.regs.regs[0] = PSCI_RET_SUCCESS as u64;
+                                                            let ret_accel_cpu_state = CpuState::Kvm(ret_kvm_state);
+                                                            vcpu.vcpu.set_state(&ret_accel_cpu_state).unwrap();
+                                                            debug!("done psci power up cpu {}", mpidr);
+                                                            //vcpu.power_on_vcpu()
+                                                            // for vcpu_ref in &vcpus {
+                                                            //     let mut target_vcpu = vcpu_ref.lock().unwrap();
+                                                            //     if target_vcpu.get_mpidr() == mpidr {
+                                                            //         if !target_vcpu.get_enabled() {
+                                                            //             target_vcpu.set_enabled(true).unwrap();
+                                                            //             let mut target_state = target_vcpu.vcpu.state().unwrap().clone();
+                                                            //             let CpuState::Kvm(ref mut target_kvm_state) = target_state;
+                                                            //             target_kvm_state.core_regs.regs.regs[0] = context_id;
+                                                            //             target_kvm_state.core_regs.regs.pc = entry;
+                                                            //             target_vcpu.vcpu.set_state(&target_state).unwrap();
+                                                            //         }
+                                                            //     }
+                                                            // }
+                                                        } else { // vcpu not plugged in
+                                                            let mut ret_kvm_state = kvm_state.clone();
+                                                            ret_kvm_state.core_regs.regs.regs[0] = PSCI_RET_DENIED as u64;
+                                                            let ret_accel_cpu_state = CpuState::Kvm(ret_kvm_state);
+                                                            vcpu.vcpu.set_state(&ret_accel_cpu_state).unwrap();
+                                                        }
+                                                    },
+                                                    PSCI_0_2_FN_CPU_OFF => {
+                                                        // TODO
+                                                    }
+                                                    _ => {
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 },
 
                                 Err(e) => {
@@ -1266,7 +1437,7 @@ impl CpuManager {
                                 break;
                             }
                         }
-                    })
+                    }))
                     .or_else(|_| {
                         panic_vcpu_run_interrupted.store(true, Ordering::SeqCst);
                         error!("vCPU thread panicked");
@@ -1279,8 +1450,12 @@ impl CpuManager {
 
         // On hot plug calls into this function entry_point is None. It is for
         // those hotplug CPU additions that we need to set the inserting flag.
-        self.vcpu_states[usize::try_from(vcpu_id).unwrap()].handle = handle;
+        //self.vcpu_states[usize::try_from(vcpu_id)].handle = Arc::new(Mutex::new(handle));
         self.vcpu_states[usize::try_from(vcpu_id).unwrap()].inserting = inserting;
+        let mut handle_guard = self.vcpu_states[usize::from(vcpu_id)].handle.lock().unwrap();
+        *handle_guard = handle;
+        debug!("put handle of vcpu {}", vcpu_id);
+        //self.vcpu_states[usize::from(vcpu_id)].inserting = inserting;
 
         Ok(())
     }
@@ -1376,7 +1551,7 @@ impl CpuManager {
         state.signal_thread();
         state.wait_until_signal_acknowledged();
         state.join_thread()?;
-        state.handle = None;
+        state.handle = Arc::new(Mutex::new(None));
 
         // Once the thread has exited, clear the "kill" so that it can reused
         state.kill.store(false, Ordering::SeqCst);
